@@ -7,21 +7,17 @@
 
 #define REV "REV0001"
 
-const char *ssid = "Metro"; //Ap SSID
-const char *password = "";  //Ap Password
+const char *ssidAP = "ConfigureDevice"; //Ap SSID
+const char *passwordAP = "";  //Ap Password
 String revision = "";       //Read revision 
-String sssid = "";          //Read SSID From Web Page
-String passs = "";          //Read Password From Web Page
+String ssid = "";          //Read SSID From Web Page
+String pass = "";          //Read Password From Web Page
 String mqtt = "";           //Read mqtt server From Web Page
 String mqttport = "";       //Read mqtt port From Web Page
 String idx = "";            //Read idx From Web Page
 int startServer = 0;
 int debug = 0;
-IPAddress ipStatic(192, 168, 1, 177);
-IPAddress gateway(192, 168, 1, 249);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress dns(192, 168, 1, 249);
-ESP8266WebServer server(80);                           //Specify port 
+ESP8266WebServer server(80);//Specify port 
 WiFiClient client;
 
 void dumpEEPROM(){
@@ -136,7 +132,7 @@ void setup() {
   //pinMode(0,INPUT); //Go to AP Mode Button
   //pinMode(2,OUTPUT); //Go to Sta Mode Button
   // Reading EEProm SSID-Password
-  if(getParams(revision,sssid,passs,mqtt,mqttport,idx) !=0 ){
+  if(getParams(revision,ssid,pass,mqtt,mqttport,idx) !=0 ){
     // Config mode
     startServer = 0;
   }
@@ -144,8 +140,8 @@ void setup() {
     WiFi.mode(WIFI_STA);
     char localSsid [50];
     char localPass [50];
-    sprintf(localSsid,"%s",sssid.c_str());
-    sprintf(localPass,"%s",passs.c_str());
+    sprintf(localSsid,"%s",ssid.c_str());
+    sprintf(localPass,"%s",pass.c_str());
     WiFi.begin(localSsid,localPass);
     while (WiFi.status() != WL_CONNECTED) {
       delay(500);
@@ -198,7 +194,7 @@ void D_AP_SER_Page() {
   st += "</select>";
   IPAddress ip = WiFi.softAPIP(); // Get ESP8266 IP Adress
   // Generate the html setting page
-  s = "\n\r\n<!DOCTYPE HTML>\r\n<html><h1> Metro Store</h1> ";
+  s = "\n\r\n<!DOCTYPE HTML>\r\n<html><h1>Device settings</h1> ";
   s += "<p>";
   s += "<form method='get' action='a'>"+st+"<label>Paswoord: </label><input name='pass' length=64><br><label>MQTT Server : </label><input name='mqtt' length=64><br><label>MQTT port : </label><input name='mqttport' length=6><br><label>Idx: </label><input name='idx' length=6><br><input type='submit'></form>";
   s += "</html>\r\n\r\n";
@@ -207,19 +203,16 @@ void D_AP_SER_Page() {
 // Process reply 
 void Get_Req(){
   if (server.hasArg("ssid") && server.hasArg("pass")){  
-    sssid=server.arg("ssid");//Get SSID
-    passs=server.arg("pass");//Get Password
+    ssid=server.arg("ssid");//Get SSID
+    pass=server.arg("pass");//Get Password
     mqtt=server.arg("mqtt");
     mqttport=server.arg("mqttport");
     idx=server.arg("idx");
   }
-  if (debug == 1){
-    Serial.println("Ssid selected ="+sssid); 
-  }
   // Write parameters in eeprom
-  setParams(sssid,passs,mqtt,mqttport,idx);
-  String s = "\r\n\r\n<!DOCTYPE HTML>\r\n<html><h1>Metro Store</h1> ";
-  s += "<p>Password Saved... Reset to boot into new wifi</html>\r\n\r\n";
+  setParams(ssid,pass,mqtt,mqttport,idx);
+  String s = "\r\n\r\n<!DOCTYPE HTML>\r\n<html><h1>Device settings</h1> ";
+  s += "<p>Settings Saved... Reset to boot into new wifi</html>\r\n\r\n";
   server.send(200,"text/html",s);
   if (debug == 1){
     Serial.println("Rebooting ESP");
@@ -240,15 +233,11 @@ void ClearEeprom(){
 
 void loop() {
   if (startServer == 0){ 
-  //if (digitalRead(0) == HIGH && startServer == 0){
-    //digitalWrite(2,HIGH);
     WiFi.mode(WIFI_AP_STA); //Both in Station and Access Point Mode
-    WiFi.config(ipStatic, dns, gateway, subnet); // Set static IP
-    WiFi.softAP(ssid, password); // Access Point Mode
+    WiFi.softAP(ssidAP, passwordAP); // Access Point Mode
     delay(100); //Stable AP
     server.on("/",D_AP_SER_Page); 
     server.on("/a",Get_Req); // If submit button is pressed get the new SSID and Password and store it in EEPROM 
-    //Serial.println("In Ap Mode");
     server.begin();
     startServer = 1;  
   }
