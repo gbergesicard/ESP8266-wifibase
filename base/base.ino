@@ -9,12 +9,12 @@
 
 const char *ssidAP = "ConfigureDevice"; //Ap SSID
 const char *passwordAP = "";  //Ap Password
-String revision = "";       //Read revision 
-String ssid = "";          //Read SSID From Web Page
-String pass = "";          //Read Password From Web Page
-String mqtt = "";           //Read mqtt server From Web Page
-String mqttport = "";       //Read mqtt port From Web Page
-String idx = "";            //Read idx From Web Page
+char revision[10]; //Read revision 
+char ssid[33];     //Read SSID From Web Page
+char pass[64];     //Read Password From Web Page
+char mqtt[100];    //Read mqtt server From Web Page
+char mqttport[6];  //Read mqtt port From Web Page
+char idx[10];      //Read idx From Web Page
 int startServer = 0;
 int debug = 0;
 ESP8266WebServer server(80);//Specify port 
@@ -30,48 +30,69 @@ void dumpEEPROM(){
   Serial.println("\ndumpEEPROM stop");
 }
 
-void readParam(String value,int* index){
+// Clear Eeprom
+void ClearEeprom(){
+  if (debug == 1){
+    Serial.println("Clearing Eeprom");
+  }
+  for (int i = 0; i < 500; ++i) { EEPROM.write(i, 0); }
+  if (debug == 1){
+    Serial.println("Clearing Eeprom end");
+  }
+}
+
+void readParam(char* value,int* index){
   char currentChar = '0';
-  value="";
+  int i = 0;
+  value[0]='\0';
   do{
     currentChar = char(EEPROM.read(*index));
     if(currentChar != '\0'){
-      value += currentChar;
+      value[i] = currentChar;
     }
     (*index)++;
+    i++;
   }while (currentChar != '\0');
+  value[i]='\0';
   if (debug == 1){
-    Serial.println("readParam ("+value+")");
+    Serial.print("readParam (");
+    Serial.print(value);
+    Serial.println(")");
   }
 
 }
-int readRevison(String value,int* index){
+int readRevison(char* value,int* index){
   char currentChar = '0';
-  value="";
+  int i = 0;
+  value[0]= '\0';
   do{
     currentChar = char(EEPROM.read(*index));
     if(currentChar != '\0'){
-      value += currentChar;
+      value[i] = currentChar;
     }
     if(*index == 2 && !(value[0] =='R' && value[1] =='E' && value[2] =='V')){
       if (debug == 1){
-        Serial.println("Revision read : "+value);
+        Serial.print("Revision read : ");
+        Serial.println(value);
       }
       return -1;
     }
     (*index)++;
+    i++;
   }while (currentChar != '\0');
+  value[i]='\0';
   if (debug == 1){
-    Serial.println("Revision read : "+value);
+    Serial.print("Revision read : ");
+    Serial.println(value);
   }
   // Compare the revision
-  if (strcmp(value.c_str(),REV) != 0){
+  if (strcmp(value,REV) != 0){
     return -2;
   }
   return 0;
 }
 
-int getParams(String revision,String ssid,String pass,String mqtt,String mqttPort,String idx){
+int getParams(char* revision,char* ssid,char* pass,char* mqtt,char* mqttPort,char* idx){
   int i =0;
   int wnReturn = 0;
   wnReturn = readRevison (revision,&i);
@@ -91,13 +112,14 @@ int getParams(String revision,String ssid,String pass,String mqtt,String mqttPor
   return 0;
 }
 
-void writeParam(String value,int* index){
+void writeParam(char* value,int* index){
   if (debug == 1){
-    Serial.print("writeParam "+value);
+    Serial.print("writeParam ");
+    Serial.print(value);
     Serial.print(" Index = ");
     Serial.println(*index);
   }
-  for (int i = 0; i < value.length(); ++i)
+  for (int i = 0; i < strlen(value); ++i)
   {
     EEPROM.write(*index, value[i]);
     (*index) ++;
@@ -105,13 +127,12 @@ void writeParam(String value,int* index){
   EEPROM.write(*index, '\0');
   (*index)++;
 }
-void setParams(String ssid,String pass,String mqtt,String mqttPort,String idx){
+void setParams(char* ssid,char* pass,char* mqtt,char* mqttPort,char* idx){
   int i =0;
-  String revision = REV;
   
   ClearEeprom();//First Clear Eeprom
   delay(10);
-  writeParam(revision,&i);
+  writeParam(REV,&i);
   writeParam(ssid,&i);
   writeParam(pass,&i);
   writeParam(mqtt,&i);
@@ -119,64 +140,26 @@ void setParams(String ssid,String pass,String mqtt,String mqttPort,String idx){
   writeParam(idx,&i);
   EEPROM.commit();
 }
-
-void setup() {
-  startServer = 1;
-  delay(200); //Stable Wifi
-  Serial.begin(9600); //Set Baud Rate 
-  EEPROM.begin(512);
+void resetSettings(){
   if (debug == 1){
-    Serial.println("Configuring access point...");
-    dumpEEPROM();
+    Serial.println("");
+    Serial.println("Reset EEPROM");  
+    Serial.println("Rebooting ESP");
   }
-  //pinMode(0,INPUT); //Go to AP Mode Button
-  //pinMode(2,OUTPUT); //Go to Sta Mode Button
-  // Reading EEProm SSID-Password
-  if(getParams(revision,ssid,pass,mqtt,mqttport,idx) !=0 ){
-    // Config mode
-    startServer = 0;
-  }
-  else{
-    WiFi.mode(WIFI_STA);
-    char localSsid [50];
-    char localPass [50];
-    sprintf(localSsid,"%s",ssid.c_str());
-    sprintf(localPass,"%s",pass.c_str());
-    WiFi.begin(localSsid,localPass);
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      if (debug == 1){
-        Serial.print(".");
-      }
-    }
-    if (debug == 1){
-      Serial.print(".");
-      Serial.println("");
-      Serial.println("WiFi connected");  
-      Serial.println("IP address: ");
-      Serial.println(WiFi.localIP());
-    }
-
-    WiFi.hostname("SwitchWIFI");
-    // Start the web server
-    server.begin();
-    // http://<ip address>/switch?state=on
-    server.on("/switch", []() {
-      String state=server.arg("state");
-      if (state == "on") setOn();
-      else if (state == "off") setOff();
-      server.send(200, "text/plain", "switch is now " + state);
-    });
-  }
+  ClearEeprom();//First Clear Eeprom
+  server.send(200, "text/plain", "Reseting settings, ESP will reboot soon");
+  delay(100);
+  EEPROM.commit();
+  ESP.restart();
 }
 
-void setOn(){
+void setOff(){
  Serial.write("\xa0\x01"); // OPEN RELAY
  Serial.write(0x00); // null terminates a string so it has to be sent on its own
  Serial.write(0xa1);
 }
 
-void setOff(){
+void setOn(){
  Serial.write("\xa0\x01\x01\xa2"); // CLOSE RELAY
 }
 
@@ -203,11 +186,11 @@ void D_AP_SER_Page() {
 // Process reply 
 void Get_Req(){
   if (server.hasArg("ssid") && server.hasArg("pass")){  
-    ssid=server.arg("ssid");//Get SSID
-    pass=server.arg("pass");//Get Password
-    mqtt=server.arg("mqtt");
-    mqttport=server.arg("mqttport");
-    idx=server.arg("idx");
+    strcpy(ssid,server.arg("ssid").c_str());//Get SSID
+    strcpy(pass,server.arg("pass").c_str());//Get Password
+    strcpy(mqtt,server.arg("mqtt").c_str());
+    strcpy(mqttport,server.arg("mqttport").c_str());
+    strcpy(idx,server.arg("idx").c_str());
   }
   // Write parameters in eeprom
   setParams(ssid,pass,mqtt,mqttport,idx);
@@ -220,14 +203,65 @@ void Get_Req(){
   ESP.restart();
 }
 
-// Clear Eeprom
-void ClearEeprom(){
+void setup() {
+  startServer = 1;
+  revision[0] = '\0';
+  ssid[0] = '\0';
+  pass[0] = '\0';
+  mqtt[0] = '\0';
+  mqttport[0] = '\0';
+  idx[0] = '\0';
+
+  delay(200); //Stable Wifi
+  Serial.begin(9600); //Set Baud Rate 
+  EEPROM.begin(512);
   if (debug == 1){
-    Serial.println("Clearing Eeprom");
+    Serial.println("Configuring access point...");
+    dumpEEPROM();
   }
-  for (int i = 0; i < 500; ++i) { EEPROM.write(i, 0); }
-  if (debug == 1){
-    Serial.println("Clearing Eeprom end");
+  //pinMode(0,INPUT); //Go to AP Mode Button
+  //pinMode(2,OUTPUT); //Go to Sta Mode Button
+  // Reading EEProm SSID-Password
+  if(getParams(revision,ssid,pass,mqtt,mqttport,idx) !=0 ){
+    // Config mode
+    startServer = 0;
+  }
+  else{
+    WiFi.mode(WIFI_STA);
+    if (debug == 1){
+      Serial.println(ssid);
+      Serial.println(pass);
+      Serial.println(mqtt);  
+      Serial.println(mqttport);
+      Serial.println(idx);
+    }
+
+    WiFi.begin(ssid,pass);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      if (debug == 1){
+        Serial.print(".");
+      }
+    }
+    if (debug == 1){
+      Serial.print(".");
+      Serial.println("");
+      Serial.println("WiFi connected");  
+      Serial.println("IP address: ");
+      Serial.println(WiFi.localIP());
+    }
+
+    WiFi.hostname("SwitchWIFI");
+    // Start the web server
+    server.begin();
+    // http://<ip address>/switch?state=on
+    server.on("/switch", []() {
+      String state=server.arg("state");
+      if (state == "on") setOn();
+      else if (state == "off") setOff();
+      server.send(200, "text/plain", "switch is now " + state);
+    });
+    server.on("/reset",resetSettings);
   }
 }
 
