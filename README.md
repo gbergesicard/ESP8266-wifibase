@@ -4,87 +4,38 @@ This project contains different base implementations for ESP8266 with WiFi confi
 
 ## 📋 Table of Contents
 
-1. [Project Structure](#project-structure)
+1. [Project Structure](#-project-structure)
    - [Base Implementation](#basebaseino)
    - [Captive Portal Version](#basecaptiveintranetbasecaptiveintranetino)
    - [MQTT Version](#basemqttbasemqttino)
-   - [ESPSomfy Bridge](#espsomfy-rts-mqtt-to-restespsomfy-rts-mqtt-t3. Navigate to 192.168.1.1 for reconfiguration
-```
+   - [ESPSomfy Bridge](#espsomfy-rts-mqtt-to-restespsomfy-rts-mqtt-to-restino)
 
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-### Development Setup:
-1. Install Arduino IDE with ESP8266 board package
-2. Install required libraries via Library Manager
-3. Clone this repository
-4. Open desired `.ino` file in Arduino IDE
-5. Configure board settings for your ESP8266 variant
-
-### Coding Standards:
-- Use meaningful variable names
-- Comment complex logic
-- Follow existing code style
-- Test on actual hardware before submitting PR
-
----
-
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
-
----
-
-## 🏷️ Version History
-
-- **v1.0** - Basic WiFi configuration and relay control
-- **v1.1** - Added captive portal functionality  
-- **v1.2** - MQTT integration for domoticz
-- **v2.0** - ESPSomfy-RTS MQTT bridge with enterprise features
-
----
-
-## 📞 Support
-
-For support and questions:
-- Open an issue on GitHub
-- Check the troubleshooting section above
-- Review the technical documentation
-
-**Hardware Compatibility:**
-- ✅ NodeMCU v1.0 (ESP8266)
-- ✅ Wemos D1 Mini
-- ✅ ESP8266-01 (with adapter)
-- ✅ Generic ESP8266 boards
-
-**Tested With:**
-- Arduino IDE 2.x
-- ESP8266 Core 3.x
-- Home Assistant
-- Mosquitto MQTT Broker
-- ESPSomfy-RTS v2.xrestino)
-
-2. [Configuration](#common-configuration)
+2. [Configuration](#-common-configuration)
    - [EEPROM Parameters](#parameters-stored-in-eeprom)
    - [Web Interface](#web-configuration-interface)
    - [Available Endpoints](#available-web-endpoints)
 
-3. [Usage Guide](#usage)
-   - [Basic Setup](#usage)
-   - [ESPSomfy Bridge Usage](#espsomfy-rts-mqtt-bridge-usage)
+3. [Usage Guide](#-usage)
+   - [Basic Setup](#basic-setup)
+   - [ESPSomfy Bridge Usage](#-espsomfy-rts-mqtt-bridge-usage)
 
-4. [Dependencies](#arduino-dependencies)
+4. [Dependencies](#-arduino-dependencies)
 
-5. [Technical Specifications](#technical-notes)
+5. [Technical Specifications](#️-technical-notes)
 
-6. [Troubleshooting](#troubleshooting)
+6. [Troubleshooting](#-troubleshooting)
+
+7. [Contributing](#-contributing)
+
+8. [License](#-license)
+
+9. [Version History](#️-version-history)
+
+10. [Support](#-support)
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ### `base/base.ino`
 **Basic WiFi configuration with web server**
@@ -154,6 +105,7 @@ Professional-grade bridge implementation that converts MQTT commands to REST API
 - **WiFi timeout**: Automatic fallback to setup mode on connection failure
 
 **📡 Comprehensive MQTT Topics:**
+
 *Command Topics (subscribe):*
 - Shade control: `{prefix}/shades/[1-32]/direction/set`, `target/set`, `tiltTarget/set`
 - Position setting: `{prefix}/shades/[1-32]/position/set`, `tiltPosition/set`
@@ -281,6 +233,8 @@ Serial commands to control external relay:
 ---
 
 ## 🚀 Usage
+
+### Basic Setup
 
 1. **Initial configuration:**
    - Power on the ESP8266
@@ -457,7 +411,7 @@ ping espsomfyrts
 curl http://espsomfyrts/controller
 
 # MQTT connection test
-mosquitto_pub -h mqtt-broker -t "somfy/bridge/debug/set" -m "1"
+mosquitto_pub -h mqtt-broker -t "root/bridge/debug/set" -m "1"
 ```
 
 **Common Issues:**
@@ -505,3 +459,59 @@ curl http://bridge-ip/debug?enable=1
 3. Connect to setup WiFi network (see AP name in serial)
 4. Navigate to 192.168.1.1 for reconfiguration
 ```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+### Development Setup:
+1. Install Arduino IDE with ESP8266 board package
+2. Install required libraries via Library Manager
+3. Clone this repository
+4. Open desired `.ino` file in Arduino IDE
+5. Configure board settings for your ESP8266 variant
+
+### Coding Standards:
+- Use meaningful variable names
+- Comment complex logic
+- Follow existing code style
+- Test on actual hardware before submitting PR
+
+---
+
+## 📄 License
+
+This project is open source and available under the [MIT License](LICENSE).
+
+---
+
+## 🏷️ Version History
+
+- **v1.0** - Basic WiFi configuration and relay control
+- **v1.1** - Added captive portal functionality  
+- **v1.2** - MQTT integration for domoticz
+- **v2.0** - ESPSomfy-RTS MQTT bridge with enterprise features
+
+---
+
+## 📞 Support
+
+For support and questions:
+- Open an issue on GitHub
+- Check the troubleshooting section above
+- Review the technical documentation
+
+**Hardware Compatibility:**
+- ✅ NodeMCU v1.0 (ESP8266)
+- ✅ Wemos D1 Mini
+- ✅ ESP8266-01 (with adapter)
+- ✅ Generic ESP8266 boards
+
+**Tested With:**
+- Arduino IDE 2.x
+- ESP8266 Core 3.x
+- Home Assistant
+- Mosquitto MQTT Broker
+- ESPSomfy-RTS v2.x
