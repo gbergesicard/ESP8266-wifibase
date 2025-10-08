@@ -1,14 +1,16 @@
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h> 
+#include <WiFiClientSecure.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266mDNS.h>
 #include <EEPROM.h>
 #include <string>
 #include <DNSServer.h>
 #include <ArduinoJson.h>
 
-#define REV "REV0001"
+const char* REV = "REV0001";
 
 const char *ssidAP = "ConfigureDevice"; //Ap SSID
 const char *passwordAP = "";  //Ap Password
@@ -17,11 +19,14 @@ char ssid[33];     //Read SSID From Web Page
 char pass[64];     //Read Password From Web Page
 char mqtt[100];    //Read mqtt server From Web Page
 char mqttport[6];  //Read mqtt port From Web Page
+char mqttuser[64]; //MQTT username
+char mqttpass[64]; //MQTT password
 char idx[10];      //Read idx From Web Page
 char espsomfyhost[64]; //ESPSomfy-RTS hostname
 char espsomfyport[6] = "80"; //ESPSomfy-RTS port
 char mqtttopic[32] = "root"; //MQTT topic prefix
 char apikey[65] = ""; //ESPSomfy-RTS API key
+int useMQTTS = 0; //Use MQTTS (SSL/TLS) for MQTT connection
 int startServer = 0;
 int debug = 1;
 int useHttps = 0; //Use HTTPS for ESPSomfy calls
@@ -29,6 +34,7 @@ int retryAttempts = 3; //HTTP retry attempts
 int mqttRetryInterval = 5000; //MQTT retry interval in ms
 ESP8266WebServer server(80);//Specify port 
 WiFiClient ESPclient;
+WiFiClientSecure ESPclientSecure;
 HTTPClient http;
 
 // for the captive network
@@ -40,6 +46,7 @@ int captiveNetwork = 0;
 // for mqtt
 int networkConnected = 0;
 PubSubClient client(ESPclient);
+PubSubClient clientSecure(ESPclientSecure);
 
 // ESPSomfy-RTS API endpoints
 const String SHADE_COMMAND_ENDPOINT = "/shadeCommand";
@@ -57,6 +64,10 @@ unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 60000; // 1 minute
 String lastError = "";
 unsigned long lastErrorTime = 0;
+
+// MQTT Logging
+int mqttLogging = 0; // 0 = disabled, 1 = enabled
+unsigned long logMessageCounter = 0;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // Setting management
@@ -133,7 +144,7 @@ int readRevison(char* value,int* index){
   return 0;
 }
 
-int getParams(char* revision,char* ssid,char* pass,char* mqtt,char* mqttPort,char* idx,char* espsomfyhost,char* espsomfyport,char* mqtttopic,char* apikey){
+int getParams(char* revision,char* ssid,char* pass,char* mqtt,char* mqttPort,char* mqttuser,char* mqttpass,char* idx,char* espsomfyhost,char* espsomfyport,char* mqtttopic,char* apikey,int* useMQTTS){
   int i =0;
   int wnReturn = 0;
   wnReturn = readRevison (revision,&i);
@@ -149,15 +160,27 @@ int getParams(char* revision,char* ssid,char* pass,char* mqtt,char* mqttPort,cha
   readParam(pass,&i);
   readParam(mqtt,&i);
   readParam(mqttPort,&i);
+  readParam(mqttuser,&i);
+  readParam(mqttpass,&i);
   readParam(idx,&i);
   readParam(espsomfyhost,&i);
   readParam(espsomfyport,&i);
   readParam(mqtttopic,&i);
   readParam(apikey,&i);
+  
+  // Read MQTTS setting (backward compatibility)
+  if (i < 500) {
+    char mqttsStr[2];
+    readParam(mqttsStr,&i);
+    *useMQTTS = atoi(mqttsStr);
+  } else {
+    *useMQTTS = 0; // Default to non-SSL for old configurations
+  }
+  
   return 0;
 }
 
-void writeParam(char* value,int* index){
+void writeParam(const char* value,int* index){
   if (debug == 1){
     Serial.print("writeParam ");
     Serial.print(value);
@@ -172,7 +195,7 @@ void writeParam(char* value,int* index){
   EEPROM.write(*index, '\0');
   (*index)++;
 }
-void setParams(char* ssid,char* pass,char* mqtt,char* mqttPort,char* idx,char* espsomfyhost,char* espsomfyport,char* mqtttopic,char* apikey){
+void setParams(char* ssid,char* pass,char* mqtt,char* mqttPort,char* mqttuser,char* mqttpass,char* idx,char* espsomfyhost,char* espsomfyport,char* mqtttopic,char* apikey,int useMQTTS){
   int i =0;
   
   ClearEeprom();//First Clear Eeprom
@@ -182,11 +205,19 @@ void setParams(char* ssid,char* pass,char* mqtt,char* mqttPort,char* idx,char* e
   writeParam(pass,&i);
   writeParam(mqtt,&i);
   writeParam(mqttPort,&i);
+  writeParam(mqttuser,&i);
+  writeParam(mqttpass,&i);
   writeParam(idx,&i);
   writeParam(espsomfyhost,&i);
   writeParam(espsomfyport,&i);
   writeParam(mqtttopic,&i);
   writeParam(apikey,&i);
+  
+  // Write MQTTS setting
+  char mqttsStr[2];
+  snprintf(mqttsStr, sizeof(mqttsStr), "%d", useMQTTS);
+  writeParam(mqttsStr,&i);
+  
   EEPROM.commit();
 }
 void resetSettings(){
@@ -200,6 +231,281 @@ void resetSettings(){
   delay(100);
   EEPROM.commit();
   ESP.restart();
+}
+
+// MQTT Configuration page (accessible when connected to WiFi)
+void MQTT_Config_Page() {
+  String s = "<!DOCTYPE HTML><html><head><title>MQTT Configuration</title>";
+  s += "<style>";
+  s += "body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }";
+  s += ".container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+  s += "h1 { color: #333; text-align: center; }";
+  s += ".form-group { margin-bottom: 15px; }";
+  s += "label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }";
+  s += "input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }";
+  s += "input:focus { border-color: #007bff; outline: none; }";
+  s += ".submit-btn { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; margin-top: 10px; }";
+  s += ".submit-btn:hover { background-color: #0056b3; }";
+  s += ".nav-btn { background-color: #6c757d; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; text-decoration: none; display: inline-block; }";
+  s += ".nav-btn:hover { background-color: #545b62; }";
+  s += ".help-text { font-size: 12px; color: #666; margin-top: 2px; }";
+  s += ".current-value { background-color: #e9ecef; padding: 5px; border-radius: 4px; margin-bottom: 5px; font-family: monospace; }";
+  s += ".status { padding: 10px; border-radius: 4px; margin-bottom: 15px; }";
+  s += ".status.connected { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }";
+  s += ".status.disconnected { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }";
+  s += "</style>";
+  s += "</head><body>";
+  s += "<div class='container'>";
+  s += "<h1>MQTT Configuration</h1>";
+  
+  // Navigation
+  s += "<div style='margin-bottom: 20px;'>";
+  s += "<a href='/' class='nav-btn'>Home</a>";
+  s += "<a href='/status' class='nav-btn'>Status</a>";
+  s += "<a href='/stats' class='nav-btn'>Statistics</a>";
+  s += "</div>";
+  
+  // Current MQTT status
+  s += "<div class='status ";
+  if (networkConnected && client.connected()) {
+    s += "connected'>✓ MQTT Connected to " + String(mqtt) + ":" + String(mqttport);
+  } else {
+    s += "disconnected'>✗ MQTT Disconnected";
+  }
+  s += "</div>";
+  
+  s += "<form method='get' action='mqttupdate'>";
+  
+  // Current values display
+  s += "<div class='form-group'>";
+  s += "<label>Current MQTT Server:</label>";
+  s += "<div class='current-value'>" + String(mqtt) + "</div>";
+  s += "<label for='mqtt'>New MQTT Server:</label>";
+  s += "<input type='text' id='mqtt' name='mqtt' maxlength='99' placeholder='" + String(mqtt) + "'>";
+  s += "<div class='help-text'>IP address or hostname of your MQTT broker (leave empty to keep current)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current MQTT Port:</label>";
+  s += "<div class='current-value'>" + String(mqttport) + "</div>";
+  s += "<label for='mqttport'>New MQTT Port:</label>";
+  s += "<input type='number' id='mqttport' name='mqttport' min='1' max='65535' placeholder='" + String(mqttport) + "'>";
+  s += "<div class='help-text'>Port number for MQTT broker (leave empty to keep current)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current MQTT Username:</label>";
+  s += "<div class='current-value'>" + String(strlen(mqttuser) > 0 ? mqttuser : "(not set)") + "</div>";
+  s += "<label for='mqttuser'>New MQTT Username:</label>";
+  s += "<input type='text' id='mqttuser' name='mqttuser' maxlength='63' placeholder='Enter username or leave empty'>";
+  s += "<div class='help-text'>MQTT username (leave empty to keep current, enter 'CLEAR' to remove)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current MQTT Password:</label>";
+  s += "<div class='current-value'>" + String(strlen(mqttpass) > 0 ? "*** (configured)" : "(not set)") + "</div>";
+  s += "<label for='mqttpass'>New MQTT Password:</label>";
+  s += "<input type='password' id='mqttpass' name='mqttpass' maxlength='63' placeholder='Enter password or leave empty'>";
+  s += "<div class='help-text'>MQTT password (leave empty to keep current, enter 'CLEAR' to remove)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current MQTT SSL:</label>";
+  s += "<div class='current-value'>" + String(useMQTTS ? "Enabled (MQTTS)" : "Disabled (MQTT)") + "</div>";
+  s += "<label for='mqtts'>";
+  s += "<input type='checkbox' id='mqtts' name='mqtts' value='1'> Use MQTTS (SSL/TLS)";
+  s += "</label>";
+  s += "<div class='help-text'>Check to enable secure MQTT connection (typically port 8883)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current Topic Prefix:</label>";
+  s += "<div class='current-value'>" + String(mqtttopic) + "</div>";
+  s += "<label for='mqtttopic'>New Topic Prefix:</label>";
+  s += "<input type='text' id='mqtttopic' name='mqtttopic' maxlength='31' placeholder='" + String(mqtttopic) + "'>";
+  s += "<div class='help-text'>Prefix for MQTT topics (leave empty to keep current)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<label>Current API Key:</label>";
+  s += "<div class='current-value'>" + String(strlen(apikey) > 0 ? "*** (configured)" : "(not set)") + "</div>";
+  s += "<label for='apikey'>New API Key:</label>";
+  s += "<input type='text' id='apikey' name='apikey' maxlength='64' placeholder='Enter new API key or leave empty'>";
+  s += "<div class='help-text'>ESPSomfy API Key (leave empty to keep current, enter 'CLEAR' to remove)</div>";
+  s += "</div>";
+  
+  s += "<div class='form-group'>";
+  s += "<input type='submit' class='submit-btn' value='Update MQTT Configuration'>";
+  s += "</div>";
+  
+  s += "</form>";
+  s += "</div>";
+  s += "</body></html>";
+  
+  server.send(200, "text/html", s);
+}
+
+// Process MQTT configuration update
+void Update_MQTT_Config() {
+  bool configChanged = false;
+  String message = "MQTT Configuration Updated:<br>";
+  
+  // Update MQTT server if provided
+  if (server.hasArg("mqtt") && server.arg("mqtt").length() > 0) {
+    String newMqtt = sanitizeInput(server.arg("mqtt"));
+    if (newMqtt.length() <= 99 && newMqtt != String(mqtt)) {
+      strcpy(mqtt, newMqtt.c_str());
+      message += "- MQTT Server: " + newMqtt + "<br>";
+      configChanged = true;
+    }
+  }
+  
+  // Update MQTT port if provided
+  if (server.hasArg("mqttport") && server.arg("mqttport").length() > 0) {
+    String newPort = server.arg("mqttport");
+    int portNum = newPort.toInt();
+    if (portNum > 0 && portNum <= 65535 && newPort != String(mqttport)) {
+      strcpy(mqttport, newPort.c_str());
+      message += "- MQTT Port: " + newPort + "<br>";
+      configChanged = true;
+    }
+  }
+  
+  // Update MQTT username if provided
+  if (server.hasArg("mqttuser")) {
+    String newUser = server.arg("mqttuser");
+    if (newUser == "CLEAR") {
+      strcpy(mqttuser, "");
+      message += "- MQTT Username: Cleared<br>";
+      configChanged = true;
+    } else if (newUser.length() > 0 && newUser.length() <= 63) {
+      newUser = sanitizeInput(newUser);
+      if (newUser != String(mqttuser)) {
+        strcpy(mqttuser, newUser.c_str());
+        message += "- MQTT Username: Updated<br>";
+        configChanged = true;
+      }
+    }
+  }
+  
+  // Update MQTT password if provided
+  if (server.hasArg("mqttpass")) {
+    String newPass = server.arg("mqttpass");
+    if (newPass == "CLEAR") {
+      strcpy(mqttpass, "");
+      message += "- MQTT Password: Cleared<br>";
+      configChanged = true;
+    } else if (newPass.length() > 0 && newPass.length() <= 63) {
+      newPass = sanitizeInput(newPass);
+      if (newPass != String(mqttpass)) {
+        strcpy(mqttpass, newPass.c_str());
+        message += "- MQTT Password: Updated<br>";
+        configChanged = true;
+      }
+    }
+  }
+  
+  // Update topic prefix if provided
+  if (server.hasArg("mqtttopic") && server.arg("mqtttopic").length() > 0) {
+    String newTopic = sanitizeInput(server.arg("mqtttopic"));
+    if (newTopic.length() <= 31 && newTopic != String(mqtttopic)) {
+      strcpy(mqtttopic, newTopic.c_str());
+      message += "- Topic Prefix: " + newTopic + "<br>";
+      configChanged = true;
+    }
+  }
+  
+  // Update API key if provided
+  if (server.hasArg("apikey")) {
+    String newApiKey = server.arg("apikey");
+    if (newApiKey == "CLEAR") {
+      strcpy(apikey, "");
+      message += "- API Key: Cleared<br>";
+      configChanged = true;
+    } else if (newApiKey.length() > 0 && newApiKey.length() <= 64) {
+      newApiKey = sanitizeInput(newApiKey);
+      if (newApiKey != String(apikey)) {
+        strcpy(apikey, newApiKey.c_str());
+        message += "- API Key: Updated<br>";
+        configChanged = true;
+      }
+    }
+  }
+  
+  // Update MQTTS setting
+  int newUseMQTTS = server.hasArg("mqtts") ? 1 : 0;
+  if (newUseMQTTS != useMQTTS) {
+    useMQTTS = newUseMQTTS;
+    message += "- MQTT SSL: " + String(useMQTTS ? "Enabled" : "Disabled") + "<br>";
+    configChanged = true;
+  }
+  
+  if (configChanged) {
+    // Save all parameters to EEPROM
+    setParams(ssid, pass, mqtt, mqttport, mqttuser, mqttpass, idx, espsomfyhost, espsomfyport, mqtttopic, apikey, useMQTTS);
+    
+    message += "<br>Settings saved successfully!<br>";
+    message += "ESP will restart in 5 seconds to apply changes.";
+    
+    // Log the configuration change
+    publishLog("MQTT configuration updated via web interface", "system");
+  } else {
+    message = "No changes detected in MQTT configuration.";
+  }
+  
+  // Send response page
+  String s = "<!DOCTYPE HTML><html><head><title>MQTT Configuration Updated</title>";
+  s += "<style>";
+  s += "body { font-family: Arial, sans-serif; text-align: center; margin: 50px; }";
+  s += ".success { color: green; }";
+  s += ".info { color: blue; }";
+  s += ".countdown { font-size: 20px; margin: 20px; }";
+  s += ".nav-btn { background-color: #6c757d; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; text-decoration: none; display: inline-block; }";
+  s += "</style>";
+  
+  if (configChanged) {
+    s += "<script>";
+    s += "var countdown = 5;";
+    s += "function updateCountdown() {";
+    s += "  document.getElementById('countdown').innerHTML = countdown;";
+    s += "  countdown--;";
+    s += "  if (countdown < 0) {";
+    s += "    document.getElementById('message').innerHTML = 'Restarting now...';";
+    s += "  } else {";
+    s += "    setTimeout(updateCountdown, 1000);";
+    s += "  }";
+    s += "}";
+    s += "window.onload = updateCountdown;";
+    s += "</script>";
+  }
+  
+  s += "</head><body>";
+  s += "<h1>MQTT Configuration</h1>";
+  s += "<div class='" + String(configChanged ? "success" : "info") + "'>";
+  s += message;
+  s += "</div>";
+  
+  if (configChanged) {
+    s += "<p>ESP will restart in <span id='countdown' class='countdown'>5</span> seconds...</p>";
+    s += "<p id='message'>Please wait for the restart to complete.</p>";
+  } else {
+    s += "<div style='margin-top: 20px;'>";
+    s += "<a href='/mqttconfig' class='nav-btn'>Back to MQTT Config</a>";
+    s += "<a href='/' class='nav-btn'>Home</a>";
+    s += "</div>";
+  }
+  
+  s += "</body></html>";
+  
+  server.send(200, "text/html", s);
+  
+  if (configChanged) {
+    delay(1000); // Give time for response to be sent
+    if (debug == 1) {
+      Serial.println("MQTT configuration updated, restarting ESP");
+    }
+    ESP.restart();
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -239,6 +545,58 @@ void logError(const String& error) {
   if (debug == 1) {
     Serial.println("ERROR: " + error);
   }
+}
+
+void publishLog(const String& message, const String& logType) {
+  // Check if logging is enabled and connection is available
+  if (!mqttLogging || !networkConnected) {
+    return;
+  }
+  
+  PubSubClient& mqttClient = getMQTTClient();
+  if (!mqttClient.connected()) {
+    return;
+  }
+  
+  // Avoid excessive memory allocation - limit message size
+  if (message.length() > 200) {
+    return; // Skip overly long messages to prevent memory issues
+  }
+  
+  // Feed watchdog
+  yield();
+  
+  String logTopic = String(mqtttopic) + "/bridge/log/" + logType;
+  logMessageCounter++;
+  
+  // Create optimized log message with smaller JSON buffer
+  DynamicJsonDocument logDoc(256); // Reduced buffer size
+  logDoc["t"] = millis(); // Shortened field names
+  logDoc["c"] = logMessageCounter;
+  logDoc["l"] = logType;
+  logDoc["m"] = message;
+  
+  String logJson;
+  logJson.reserve(200); // Pre-allocate string capacity
+  serializeJson(logDoc, logJson);
+  
+  // Feed watchdog before publish
+  yield();
+  
+  bool published = mqttClient.publish(logTopic.c_str(), logJson.c_str());
+  
+  if (debug == 1) {
+    Serial.print("LOG [");
+    Serial.print(logType);
+    Serial.print("]: ");
+    Serial.println(message);
+    if (!published) {
+      Serial.println("WARNING: Log publish failed");
+    }
+  }
+  
+  // Feed watchdog after
+  yield();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -377,8 +735,19 @@ void sendShadeCommand(int shadeId, const String& command, int target = -1) {
     url += "&command=" + command;
   }
   
+  // Log the REST API call
+  String logMessage = "Shade " + String(shadeId) + " - URL: " + url;
+  publishLog(logMessage, "rest_request");
+  
   String response;
   bool success = makeHttpRequest(url, response);
+  
+  // Log the REST API response
+  String responseLog = "Shade " + String(shadeId) + " - Success: " + String(success ? "YES" : "NO");
+  if (!response.isEmpty()) {
+    responseLog += ", Response: " + response;
+  }
+  publishLog(responseLog, "rest_response");
   
   if (debug == 1) {
     Serial.print("Shade command sent - ID: ");
@@ -394,9 +763,9 @@ void sendShadeCommand(int shadeId, const String& command, int target = -1) {
   }
   
   // Publish response to MQTT if successful
-  if (success && networkConnected && client.connected()) {
+  if (success && networkConnected && getMQTTClient().connected()) {
     String statusTopic = String(mqtttopic) + "/bridge/shades/" + String(shadeId) + "/status";
-    client.publish(statusTopic.c_str(), success ? "OK" : "ERROR");
+    getMQTTClient().publish(statusTopic.c_str(), success ? "OK" : "ERROR");
   }
 }
 
@@ -408,8 +777,19 @@ void sendGroupCommand(int groupId, const String& command) {
   
   String url = buildBaseUrl() + GROUP_COMMAND_ENDPOINT + "?groupId=" + String(groupId) + "&command=" + command;
   
+  // Log the REST API call
+  String logMessage = "Group " + String(groupId) + " - URL: " + url;
+  publishLog(logMessage, "rest_request");
+  
   String response;
   bool success = makeHttpRequest(url, response);
+  
+  // Log the REST API response
+  String responseLog = "Group " + String(groupId) + " - Success: " + String(success ? "YES" : "NO");
+  if (!response.isEmpty()) {
+    responseLog += ", Response: " + response;
+  }
+  publishLog(responseLog, "rest_response");
   
   if (debug == 1) {
     Serial.print("Group command sent - ID: ");
@@ -421,9 +801,9 @@ void sendGroupCommand(int groupId, const String& command) {
   }
   
   // Publish response to MQTT if successful
-  if (success && networkConnected && client.connected()) {
+  if (success && networkConnected && getMQTTClient().connected()) {
     String statusTopic = String(mqtttopic) + "/bridge/groups/" + String(groupId) + "/status";
-    client.publish(statusTopic.c_str(), success ? "OK" : "ERROR");
+    getMQTTClient().publish(statusTopic.c_str(), success ? "OK" : "ERROR");
   }
 }
 
@@ -446,8 +826,19 @@ void sendTiltCommand(int shadeId, const String& command, int target = -1) {
     url += "&command=" + command;
   }
   
+  // Log the REST API call
+  String logMessage = "Tilt Shade " + String(shadeId) + " - URL: " + url;
+  publishLog(logMessage, "rest_request");
+  
   String response;
   bool success = makeHttpRequest(url, response);
+  
+  // Log the REST API response
+  String responseLog = "Tilt Shade " + String(shadeId) + " - Success: " + String(success ? "YES" : "NO");
+  if (!response.isEmpty()) {
+    responseLog += ", Response: " + response;
+  }
+  publishLog(responseLog, "rest_response");
   
   if (debug == 1) {
     Serial.print("Tilt command sent - ID: ");
@@ -489,8 +880,19 @@ void setShadePosition(int shadeId, int position, int tiltPosition = -1) {
     url += "&tiltPosition=" + String(tiltPosition);
   }
   
+  // Log the REST API call
+  String logMessage = "Set Position Shade " + String(shadeId) + " - URL: " + url;
+  publishLog(logMessage, "rest_request");
+  
   String response;
   bool success = makeHttpRequest(url, response);
+  
+  // Log the REST API response
+  String responseLog = "Set Position Shade " + String(shadeId) + " - Success: " + String(success ? "YES" : "NO");
+  if (!response.isEmpty()) {
+    responseLog += ", Response: " + response;
+  }
+  publishLog(responseLog, "rest_response");
   
   if (debug == 1) {
     Serial.print("Position set - ID: ");
@@ -538,8 +940,25 @@ void setSensorStatus(int shadeId, int groupId, int sunny, int windy) {
     url += "&windy=" + String(windy);
   }
   
+  // Log the REST API call
+  String logMessage = "Set Sensor";
+  if (shadeId >= 0) {
+    logMessage += " Shade " + String(shadeId);
+  } else {
+    logMessage += " Group " + String(groupId);
+  }
+  logMessage += " - URL: " + url;
+  publishLog(logMessage, "rest_request");
+  
   String response;
   bool success = makeHttpRequest(url, response);
+  
+  // Log the REST API response
+  String responseLog = "Set Sensor - Success: " + String(success ? "YES" : "NO");
+  if (!response.isEmpty()) {
+    responseLog += ", Response: " + response;
+  }
+  publishLog(responseLog, "rest_response");
   
   if (debug == 1) {
     Serial.print("Sensor status set - Success: ");
@@ -551,8 +970,14 @@ void setSensorStatus(int shadeId, int groupId, int sunny, int windy) {
 // MQTT management
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Get the appropriate MQTT client based on SSL setting
+PubSubClient& getMQTTClient() {
+  return useMQTTS ? clientSecure : client;
+}
+
 void publishHeartbeat() {
-  if (!networkConnected || !client.connected()) {
+  PubSubClient& mqttClient = getMQTTClient();
+  if (!networkConnected || !mqttClient.connected()) {
     return;
   }
   
@@ -560,8 +985,8 @@ void publishHeartbeat() {
   String heartbeatTopic = String(mqtttopic) + "/bridge/heartbeat";
   String statsTopic = String(mqtttopic) + "/bridge/stats";
   
-  client.publish(statusTopic.c_str(), "online", true); // Retained message
-  client.publish(heartbeatTopic.c_str(), String(millis()).c_str());
+  mqttClient.publish(statusTopic.c_str(), "online", true); // Retained message
+  mqttClient.publish(heartbeatTopic.c_str(), String(millis()).c_str());
   
   // Publish statistics
   DynamicJsonDocument stats(512);
@@ -572,10 +997,12 @@ void publishHeartbeat() {
   stats["freeHeap"] = ESP.getFreeHeap();
   stats["lastError"] = lastError;
   stats["lastErrorTime"] = lastErrorTime;
+  stats["mqttLogging"] = mqttLogging;
+  stats["logMessages"] = logMessageCounter;
   
   String statsJson;
   serializeJson(stats, statsJson);
-  client.publish(statsTopic.c_str(), statsJson.c_str());
+  mqttClient.publish(statsTopic.c_str(), statsJson.c_str());
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -597,6 +1024,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
   
   // Sanitize payload
   strPayload = sanitizeInput(strPayload);
+  
+  // Log received MQTT message
+  publishLog("Topic: " + strTopic + ", Payload: " + strPayload, "mqtt_received");
   
   if (debug == 1){
     Serial.print("Message arrived [");
@@ -706,84 +1136,187 @@ void callback(char* topic, byte* payload, unsigned int length) {
       
       // Publish confirmation
       String responseTopic = String(mqtttopic) + "/bridge/debug";
-      client.publish(responseTopic.c_str(), strPayload.c_str());
+      getMQTTClient().publish(responseTopic.c_str(), strPayload.c_str());
+    }
+    else if (strTopic.endsWith("/logging/set")) {
+      mqttLogging = strPayload.toInt();
+      String logStatus = (mqttLogging == 1) ? "enabled" : "disabled";
+      
+      if (debug == 1) {
+        Serial.println("MQTT logging " + logStatus + " via MQTT");
+      }
+      
+      // Publish confirmation
+      String responseTopic = String(mqtttopic) + "/bridge/logging";
+      getMQTTClient().publish(responseTopic.c_str(), logStatus.c_str());
+      
+      // Log the logging state change
+      if (mqttLogging == 1) {
+        publishLog("MQTT logging enabled", "system");
+      }
     }
   }
 }
 
 void reconnect() {
-  // Loop until we're reconnected
-  int attemptCount = 0;
-  while (!client.connected() && attemptCount < 10) { // Limit reconnection attempts
-    attemptCount++;
-    if (debug == 1){
-      Serial.print("Attempting MQTT connection (");
-      Serial.print(attemptCount);
-      Serial.print("/10)...");
+  static unsigned long lastAttempt = 0;
+  static int failedAttempts = 0;
+  
+  // Limit reconnection frequency - minimum 5 seconds between attempts
+  if (millis() - lastAttempt < 5000) {
+    return;
+  }
+  
+  lastAttempt = millis();
+  
+  // Check available memory before attempting connection
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < 8192) { // Less than 8KB free
+    if (debug == 1) {
+      Serial.println("Low memory (" + String(freeHeap) + " bytes), skipping MQTT attempt");
     }
-    String clientId = "ESPSomfy-MQTT-Bridge-" + String(idx);
-   
-    // Set last will and testament
-    String lwt = String(mqtttopic) + "/bridge/status";
-    
-    // Attempt to connect with LWT
-    if (client.connect(clientId.c_str(), lwt.c_str(), 1, true, "offline")) {
-      if (debug == 1){
-        Serial.println("connected");
+    return;
+  }
+  
+  // Get the appropriate MQTT client
+  PubSubClient& mqttClient = getMQTTClient();
+  
+  // Configure SSL client if using MQTTS with better error handling
+  if (useMQTTS) {
+    try {
+      ESPclientSecure.setInsecure(); // Skip certificate validation
+      ESPclientSecure.setBufferSizes(1024, 1024); // Reduce buffer sizes to save memory
+      // Force garbage collection
+      yield();
+    } catch (...) {
+      if (debug == 1) {
+        Serial.println("SSL configuration failed");
       }
-      
-      // Once connected, publish status and authenticate ESPSomfy if needed
-      String statusTopic = String(mqtttopic) + "/bridge/status";
-      client.publish(statusTopic.c_str(), "online", true);
-      
-      // Try to authenticate with ESPSomfy-RTS
-      if (!authenticateESPSomfy()) {
-        logError("ESPSomfy authentication failed, continuing without auth");
-      }
-      
-      // Subscribe to all relevant topics using configured prefix
-      String topicPrefix = String(mqtttopic);
-      
-      // Shade topics
-      client.subscribe((topicPrefix + "/shades/+/direction/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/target/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/tiltTarget/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/position/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/tiltPosition/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/sunFlag/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/sunny/set").c_str());
-      client.subscribe((topicPrefix + "/shades/+/windy/set").c_str());
-      
-      // Group topics
-      client.subscribe((topicPrefix + "/groups/+/direction/set").c_str());
-      client.subscribe((topicPrefix + "/groups/+/sunFlag/set").c_str());
-      client.subscribe((topicPrefix + "/groups/+/sunny/set").c_str());
-      client.subscribe((topicPrefix + "/groups/+/windy/set").c_str());
-      
-      // Bridge control topics
-      client.subscribe((topicPrefix + "/bridge/debug/set").c_str());
-      
-      if (debug == 1){
-        Serial.println("MQTT subscriptions completed");
-      }
-      break;
-    } else {
-      if (debug == 1){
-        Serial.print("failed, rc=");
-        Serial.print(client.state());
-        Serial.print(" try again in ");
-        Serial.print(mqttRetryInterval / 1000);
-        Serial.println(" seconds");
-      }
-      // handle web server requests 
-      server.handleClient();
-      // Wait before retrying
-      delay(mqttRetryInterval);
+      return;
     }
   }
   
-  if (!client.connected()) {
-    logError("Failed to connect to MQTT after 10 attempts");
+  // Check if already connected
+  if (mqttClient.connected()) {
+    return;
+  }
+  
+  failedAttempts++;
+  
+  // Auto-disable SSL after 5 failed attempts to prevent crashes
+  if (failedAttempts == 5 && useMQTTS) {
+    if (debug == 1) {
+      Serial.println("SSL connection failing, switching to non-SSL MQTT");
+    }
+    useMQTTS = false;
+    // Reconfigure client
+    client.setServer(mqtt, atoi(mqttport));
+    client.setCallback(callback);
+    publishLog("Switched to non-SSL MQTT due to connection failures", "WARN");
+  }
+  
+  // Reset after too many failures
+  if (failedAttempts > 20) {
+    publishLog("MQTT connection failed 20 times, restarting ESP...", "ERROR");
+    delay(1000);
+    ESP.restart();
+  }
+  
+  // Feed watchdog
+  yield();
+  
+  if (debug == 1){
+    Serial.print("Attempting MQTT");
+    Serial.print(useMQTTS ? "S" : "");
+    Serial.print(" connection (");
+    Serial.print(failedAttempts);
+    Serial.print("/20)...");
+  }
+  
+  String clientId = "ESPSomfy-MQTT-Bridge-" + String(idx);
+ 
+  // Set last will and testament
+  String lwt = String(mqtttopic) + "/bridge/status";
+  
+  // Attempt to connect with LWT and authentication
+  bool connected = false;
+  if (strlen(mqttuser) > 0 && strlen(mqttpass) > 0) {
+    // Connect with username and password
+    connected = mqttClient.connect(clientId.c_str(), mqttuser, mqttpass, lwt.c_str(), 1, true, "offline");
+  } else {
+    // Connect without authentication
+    connected = mqttClient.connect(clientId.c_str(), lwt.c_str(), 1, true, "offline");
+  }
+  
+  // Feed watchdog
+  yield();
+  
+  if (connected) {
+    if (debug == 1){
+      Serial.println("connected");
+    }
+    
+    // Reset failed attempts counter
+    failedAttempts = 0;
+    
+    // Once connected, publish status and authenticate ESPSomfy if needed
+    String statusTopic = String(mqtttopic) + "/bridge/status";
+    mqttClient.publish(statusTopic.c_str(), "online", true);
+    
+    // Feed watchdog
+    yield();
+    
+    // Try to authenticate with ESPSomfy-RTS
+    if (!authenticateESPSomfy()) {
+      publishLog("ESPSomfy authentication failed, continuing without auth", "WARN");
+    }
+    
+    // Subscribe to all relevant topics using configured prefix
+    String topicPrefix = String(mqtttopic);
+    
+    // Shade topics
+    mqttClient.subscribe((topicPrefix + "/shades/+/direction/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/target/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/tiltTarget/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/position/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/tiltPosition/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/sunFlag/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/sunny/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/shades/+/windy/set").c_str());
+    
+    // Feed watchdog
+    yield();
+    
+    // Group topics
+    mqttClient.subscribe((topicPrefix + "/groups/+/direction/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/groups/+/sunFlag/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/groups/+/sunny/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/groups/+/windy/set").c_str());
+    
+    // Bridge control topics
+    mqttClient.subscribe((topicPrefix + "/bridge/debug/set").c_str());
+    mqttClient.subscribe((topicPrefix + "/bridge/logging/set").c_str());
+    
+    // Feed watchdog
+    yield();
+    
+    if (debug == 1){
+      Serial.println("MQTT subscriptions completed");
+    }
+    
+    publishLog("MQTT connection established successfully", "INFO");
+    
+  } else {
+    if (debug == 1){
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.print(" - will retry in 5 seconds");
+      Serial.println("");
+    }
+    
+    String errorMsg = "MQTT connection failed, state: ";
+    errorMsg += mqttClient.state();
+    publishLog(errorMsg, "ERROR");
   }
 }
 
@@ -806,118 +1339,120 @@ void D_AP_SER_Page() {
   IPAddress ip = WiFi.softAPIP(); // Get ESP8266 IP Adress
   
   // Modern HTML with CSS and JavaScript validation
-  s = R"(
-<!DOCTYPE HTML>
-<html>
-<head>
-    <title>ESPSomfy MQTT-to-REST Bridge</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
-        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-        input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        input:focus, select:focus { border-color: #007bff; outline: none; }
-        .submit-btn { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
-        .submit-btn:hover { background-color: #0056b3; }
-        .advanced { border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
-        .advanced-toggle { cursor: pointer; color: #007bff; }
-        .advanced-content { display: none; }
-        .help-text { font-size: 12px; color: #666; margin-top: 2px; }
-    </style>
-    <script>
-        function toggleAdvanced() {
-            var content = document.getElementById('advanced-content');
-            var toggle = document.getElementById('advanced-toggle');
-            if (content.style.display === 'none' || content.style.display === '') {
-                content.style.display = 'block';
-                toggle.innerHTML = '▼ Advanced Settings';
-            } else {
-                content.style.display = 'none';
-                toggle.innerHTML = '▶ Advanced Settings';
-            }
-        }
-        function validateForm() {
-            var mqttServer = document.getElementById('mqtt').value;
-            var mqttPort = document.getElementById('mqttport').value;
-            
-            if (mqttServer && !mqttPort) {
-                alert('Please specify MQTT port when MQTT server is provided');
-                return false;
-            }
-            
-            if (mqttPort && (mqttPort < 1 || mqttPort > 65535)) {
-                alert('MQTT port must be between 1 and 65535');
-                return false;
-            }
-            
-            return true;
-        }
-    </script>
-</head>
-<body>
-    <div class="container">
-        <h1>ESPSomfy MQTT-to-REST Bridge</h1>
-        <form method='get' action='a' onsubmit='return validateForm()'>
-            <div class="form-group">
-                <label for="ssid">WiFi Network:</label>
-)";
+  s = "<!DOCTYPE HTML><html><head><title>ESPSomfy MQTT-to-REST Bridge</title>";
+  s += "<style>";
+  s += "body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }";
+  s += ".container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+  s += "h1 { color: #333; text-align: center; }";
+  s += ".form-group { margin-bottom: 15px; }";
+  s += "label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }";
+  s += "input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }";
+  s += "input:focus, select:focus { border-color: #007bff; outline: none; }";
+  s += ".submit-btn { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; }";
+  s += ".submit-btn:hover { background-color: #0056b3; }";
+  s += ".advanced { border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }";
+  s += ".advanced-toggle { cursor: pointer; color: #007bff; }";
+  s += ".advanced-content { display: none; }";
+  s += ".help-text { font-size: 12px; color: #666; margin-top: 2px; }";
+  s += "</style>";
+  s += "<script>";
+  s += "function toggleAdvanced() {";
+  s += "  var content = document.getElementById('advanced-content');";
+  s += "  var toggle = document.getElementById('advanced-toggle');";
+  s += "  if (content.style.display === 'none' || content.style.display === '') {";
+  s += "    content.style.display = 'block';";
+  s += "    toggle.innerHTML = '- Advanced Settings';";
+  s += "  } else {";
+  s += "    content.style.display = 'none';";
+  s += "    toggle.innerHTML = '+ Advanced Settings';";
+  s += "  }";
+  s += "}";
+  s += "function validateForm() {";
+  s += "  var mqttServer = document.getElementById('mqtt').value;";
+  s += "  var mqttPort = document.getElementById('mqttport').value;";
+  s += "  if (mqttServer && !mqttPort) {";
+  s += "    alert('Please specify MQTT port when MQTT server is provided');";
+  s += "    return false;";
+  s += "  }";
+  s += "  if (mqttPort && (mqttPort < 1 || mqttPort > 65535)) {";
+  s += "    alert('MQTT port must be between 1 and 65535');";
+  s += "    return false;";
+  s += "  }";
+  s += "  return true;";
+  s += "}";
+  s += "</script></head><body>";
+  s += "<div class='container'>";
+  s += "<h1>ESPSomfy MQTT-to-REST Bridge</h1>";
+  s += "<form method='get' action='a' onsubmit='return validateForm()'>";
+  s += "<div class='form-group'>";
+  s += "<label for='ssid'>WiFi Network:</label>";
   s += st;
-  s += R"(
-            </div>
-            <div class="form-group">
-                <label for="pass">WiFi Password:</label>
-                <input type="password" id="pass" name="pass" maxlength="63">
-            </div>
-            <div class="form-group">
-                <label for="mqtt">MQTT Server:</label>
-                <input type="text" id="mqtt" name="mqtt" maxlength="99" placeholder="192.168.1.100">
-                <div class="help-text">IP address or hostname of your MQTT broker</div>
-            </div>
-            <div class="form-group">
-                <label for="mqttport">MQTT Port:</label>
-                <input type="number" id="mqttport" name="mqttport" min="1" max="65535" placeholder="1883">
-            </div>
-            <div class="form-group">
-                <label for="idx">Bridge ID:</label>
-                <input type="text" id="idx" name="idx" maxlength="9" placeholder="bridge1" required>
-                <div class="help-text">Unique identifier for this bridge</div>
-            </div>
-            
-            <div class="advanced">
-                <div id="advanced-toggle" class="advanced-toggle" onclick="toggleAdvanced()">▶ Advanced Settings</div>
-                <div id="advanced-content" class="advanced-content">
-                    <div class="form-group">
-                        <label for="espsomfyhost">ESPSomfy-RTS Host:</label>
-                        <input type="text" id="espsomfyhost" name="espsomfyhost" maxlength="63" placeholder="espsomfyrts">
-                        <div class="help-text">Hostname or IP of your ESPSomfy-RTS device</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="espsomfyport">ESPSomfy-RTS Port:</label>
-                        <input type="number" id="espsomfyport" name="espsomfyport" min="1" max="65535" placeholder="80">
-                    </div>
-                    <div class="form-group">
-                        <label for="mqtttopic">MQTT Topic Prefix:</label>
-                        <input type="text" id="mqtttopic" name="mqtttopic" maxlength="31" placeholder="root">
-                        <div class="help-text">Prefix for MQTT topics (e.g., root/shades/1/direction/set)</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="apikey">ESPSomfy API Key (optional):</label>
-                        <input type="text" id="apikey" name="apikey" maxlength="64">
-                        <div class="help-text">Leave empty if no authentication required</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="form-group">
-                <input type="submit" class="submit-btn" value="Save Configuration">
-            </div>
-        </form>
-    </div>
-</body>
-</html>
-)";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='pass'>WiFi Password:</label>";
+  s += "<input type='password' id='pass' name='pass' maxlength='63'>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqtt'>MQTT Server:</label>";
+  s += "<input type='text' id='mqtt' name='mqtt' maxlength='99' placeholder='192.168.1.100'>";
+  s += "<div class='help-text'>IP address or hostname of your MQTT broker</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqttport'>MQTT Port:</label>";
+  s += "<input type='number' id='mqttport' name='mqttport' min='1' max='65535' placeholder='1883'>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqttuser'>MQTT Username (optional):</label>";
+  s += "<input type='text' id='mqttuser' name='mqttuser' maxlength='63' placeholder='mqtt_user'>";
+  s += "<div class='help-text'>Leave empty if no authentication required</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqttpass'>MQTT Password (optional):</label>";
+  s += "<input type='password' id='mqttpass' name='mqttpass' maxlength='63' placeholder='mqtt_password'>";
+  s += "<div class='help-text'>Leave empty if no authentication required</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqtts'>";
+  s += "<input type='checkbox' id='mqtts' name='mqtts' value='1'> Use MQTTS (SSL/TLS)";
+  s += "</label>";
+  s += "<div class='help-text'>Check this box to use secure MQTT connection (typically port 8883)</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='idx'>Bridge ID:</label>";
+  s += "<input type='text' id='idx' name='idx' maxlength='9' placeholder='bridge1' required>";
+  s += "<div class='help-text'>Unique identifier for this bridge</div>";
+  s += "</div>";
+  s += "<div class='advanced'>";
+  s += "<div id='advanced-toggle' class='advanced-toggle' onclick='toggleAdvanced()'>+ Advanced Settings</div>";
+  s += "<div id='advanced-content' class='advanced-content'>";
+  s += "<div class='form-group'>";
+  s += "<label for='espsomfyhost'>ESPSomfy-RTS Host:</label>";
+  s += "<input type='text' id='espsomfyhost' name='espsomfyhost' maxlength='63' placeholder='espsomfyrts'>";
+  s += "<div class='help-text'>Hostname or IP of your ESPSomfy-RTS device</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='espsomfyport'>ESPSomfy-RTS Port:</label>";
+  s += "<input type='number' id='espsomfyport' name='espsomfyport' min='1' max='65535' placeholder='80'>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='mqtttopic'>MQTT Topic Prefix:</label>";
+  s += "<input type='text' id='mqtttopic' name='mqtttopic' maxlength='31' placeholder='root'>";
+  s += "<div class='help-text'>Prefix for MQTT topics (e.g., root/shades/1/direction/set)</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<label for='apikey'>ESPSomfy API Key (optional):</label>";
+  s += "<input type='text' id='apikey' name='apikey' maxlength='64'>";
+  s += "<div class='help-text'>Leave empty if no authentication required</div>";
+  s += "</div>";
+  s += "</div>";
+  s += "</div>";
+  s += "<div class='form-group'>";
+  s += "<input type='submit' class='submit-btn' value='Save Configuration'>";
+  s += "</div>";
+  s += "</form>";
+  s += "</div>";
+  s += "</body></html>";
+  
   server.send(200, "text/html", s);
 }
 // Process reply 
@@ -941,11 +1476,16 @@ void Get_Req(){
     strcpy(pass, sanitizedPass.c_str());
     strcpy(mqtt, sanitizedMqtt.c_str());
     strcpy(mqttport, server.arg("mqttport").c_str());
+    strcpy(mqttuser, sanitizeInput(server.arg("mqttuser")).c_str());
+    strcpy(mqttpass, sanitizeInput(server.arg("mqttpass")).c_str());
     strcpy(idx, sanitizedIdx.c_str());
     strcpy(espsomfyhost, sanitizedESPSomfyHost.c_str());
     strcpy(espsomfyport, server.arg("espsomfyport").c_str());
     strcpy(mqtttopic, sanitizeInput(server.arg("mqtttopic")).c_str());
     strcpy(apikey, sanitizeInput(server.arg("apikey")).c_str());
+    
+    // Handle MQTTS checkbox
+    useMQTTS = server.hasArg("mqtts") ? 1 : 0;
     
     // Set defaults for empty values
     if (strlen(espsomfyhost) == 0) {
@@ -960,7 +1500,7 @@ void Get_Req(){
   }
   
   // Write parameters in eeprom
-  setParams(ssid,pass,mqtt,mqttport,idx,espsomfyhost,espsomfyport,mqtttopic,apikey);
+  setParams(ssid,pass,mqtt,mqttport,mqttuser,mqttpass,idx,espsomfyhost,espsomfyport,mqtttopic,apikey,useMQTTS);
   
   String s = R"(
 <!DOCTYPE HTML>
@@ -1003,18 +1543,27 @@ void Get_Req(){
 }
 
 void setup() {
+  // Optimize memory usage and prevent stack overflow
+  ESP.wdtDisable(); // Disable watchdog temporarily
+  
   startServer = 1;
   revision[0] = '\0';
   ssid[0] = '\0';
   pass[0] = '\0';
   mqtt[0] = '\0';
   mqttport[0] = '\0';
+  mqttuser[0] = '\0';
+  mqttpass[0] = '\0';
   idx[0] = '\0';
   espsomfyhost[0] = '\0';
 
   delay(200); //Stable Wifi
   Serial.begin(9600); //Set Baud Rate 
   EEPROM.begin(512);
+  
+  // Re-enable watchdog with longer timeout
+  ESP.wdtEnable(8000); // 8 second timeout
+  
   if (debug == 1){
     Serial.println("ESPSomfy MQTT-to-REST Bridge starting...");
     Serial.println("Firmware version: " + String(REV));
@@ -1023,7 +1572,7 @@ void setup() {
   }
   
   // Reading EEProm parameters
-  if(getParams(revision,ssid,pass,mqtt,mqttport,idx,espsomfyhost,espsomfyport,mqtttopic,apikey) !=0 ){
+  if(getParams(revision,ssid,pass,mqtt,mqttport,mqttuser,mqttpass,idx,espsomfyhost,espsomfyport,mqtttopic,apikey,&useMQTTS) !=0 ){
     // Config mode
     startServer = 0;
     if (debug == 1){
@@ -1072,10 +1621,64 @@ void setup() {
         Serial.println("Signal strength: " + String(WiFi.RSSI()) + " dBm");
       }
       
+      // Start mDNS service for local domain name resolution
+      String hostname = "espsomfyMQTT";
+      if (strlen(idx) > 0) {
+        hostname += "-" + String(idx);
+      }
+      
+      if (MDNS.begin(hostname)) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("mqtt", "tcp", atoi(mqttport));
+        if (debug == 1) {
+          Serial.println("mDNS started: http://" + hostname + ".local");
+        }
+      } else {
+        if (debug == 1) {
+          Serial.println("mDNS failed to start");
+        }
+      }
+      
       // Connect mqtt server only if configured
       if (strlen(mqtt) > 0 && strlen(mqttport) > 0) {
-        client.setServer(mqtt, atoi(mqttport));
-        client.setCallback(callback);
+        // Check memory before configuring MQTT
+        uint32_t freeHeap = ESP.getFreeHeap();
+        if (debug == 1) {
+          Serial.println("Free heap before MQTT setup: " + String(freeHeap) + " bytes");
+        }
+        
+        if (freeHeap < 10240) { // Less than 10KB free
+          if (debug == 1) {
+            Serial.println("Warning: Low memory, disabling SSL to prevent crashes");
+          }
+          useMQTTS = false; // Force disable SSL if low memory
+        }
+        
+        if (useMQTTS) {
+          if (debug == 1) {
+            Serial.println("Configuring MQTTS (SSL) connection...");
+          }
+          try {
+            clientSecure.setServer(mqtt, atoi(mqttport));
+            clientSecure.setCallback(callback);
+            if (debug == 1) {
+              Serial.println("MQTTS configured successfully");
+            }
+          } catch (...) {
+            if (debug == 1) {
+              Serial.println("MQTTS configuration failed, falling back to MQTT");
+            }
+            useMQTTS = false;
+            client.setServer(mqtt, atoi(mqttport));
+            client.setCallback(callback);
+          }
+        } else {
+          if (debug == 1) {
+            Serial.println("Configuring MQTT (non-SSL) connection...");
+          }
+          client.setServer(mqtt, atoi(mqttport));
+          client.setCallback(callback);
+        }
         networkConnected = 1;
       } else {
         if (debug == 1){
@@ -1096,7 +1699,96 @@ void setup() {
     
     // Enhanced web endpoints
     server.on("/", []() {
-      server.send(200, "text/html", "<h1>ESPSomfy MQTT Bridge</h1><p><a href='/status'>Status</a> | <a href='/stats'>Statistics</a> | <a href='/reset'>Reset</a></p>");
+      // Create modern homepage with status information
+      String s = "<!DOCTYPE HTML><html><head><title>ESPSomfy MQTT Bridge</title>";
+      s += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+      s += "<meta charset='UTF-8'>";
+      s += "<style>";
+      s += "body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#667eea;color:white;}";
+      s += ".container{max-width:800px;margin:0 auto;}";
+      s += ".header{text-align:center;margin-bottom:20px;}";
+      s += ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px;}";
+      s += ".card{background:white;color:#333;border-radius:8px;padding:15px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+      s += ".card-title{font-weight:bold;margin-bottom:10px;}";
+      s += ".status-ok{color:#28a745;}";
+      s += ".status-error{color:#dc3545;}";
+      s += ".status-warning{color:#ffc107;}";
+      s += ".nav{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;}";
+      s += ".btn{display:block;background:white;color:#333;padding:10px;border-radius:4px;text-decoration:none;text-align:center;font-weight:bold;}";
+      s += ".btn:hover{background:#f0f0f0;}";
+      s += ".btn-primary{background:#007bff;color:white;}";
+      s += ".btn-danger{background:#dc3545;color:white;}";
+      s += "</style></head><body>";
+      
+      s += "<div class='container'>";
+      s += "<div class='header'>";
+      s += "<h1>ESPSomfy MQTT Bridge</h1>";
+      s += "<p>Version " + String(REV) + "</p>";
+      s += "</div>";
+      s += "<div class='cards'>";
+      
+      // WiFi Status Card
+      s += "<div class='card'>";
+      s += "<div class='card-title'>WiFi</div>";
+      if (WiFi.status() == WL_CONNECTED) {
+        s += "<div class='status-ok'>Connecte</div>";
+        s += "<small>IP: " + WiFi.localIP().toString() + "<br>";
+        
+        // Show mDNS hostname if available
+        String hostname = "espsomfyMQTT";
+        if (strlen(idx) > 0) {
+          hostname += "-" + String(idx);
+        }
+        s += "mDNS: " + hostname + ".local</small>";
+      } else {
+        s += "<div class='status-error'>Deconnecte</div>";
+      }
+      s += "</div>";
+      
+      // MQTT Status Card  
+      s += "<div class='card'>";
+      s += "<div class='card-title'>MQTT</div>";
+      if (networkConnected && getMQTTClient().connected()) {
+        s += "<div class='status-ok'>Connecte</div>";
+        s += "<small>" + String(mqtt) + ":" + String(mqttport);
+        if (useMQTTS) s += " (SSL)";
+        s += "</small>";
+      } else if (networkConnected) {
+        s += "<div class='status-warning'>Deconnecte</div>";
+      } else {
+        s += "<div class='status-error'>Non configure</div>";
+      }
+      s += "</div>";
+      
+      // ESPSomfy Status Card
+      s += "<div class='card'>";
+      s += "<div class='card-title'>ESPSomfy</div>";
+      if (strlen(espsomfyhost) > 0) {
+        s += "<div class='status-ok'>Configure</div>";
+        s += "<small>" + String(espsomfyhost) + ":" + String(espsomfyport) + "</small>";
+      } else {
+        s += "<div class='status-warning'>Non configure</div>";
+      }
+      s += "</div>";
+      
+      // System Info Card
+      s += "<div class='card'>";
+      s += "<div class='card-title'>Systeme</div>";
+      s += "<div>RAM: " + String(ESP.getFreeHeap() / 1024) + " KB</div>";
+      s += "<small>Uptime: " + String(millis() / 60000) + " min</small>";
+      s += "</div>";
+      s += "</div>"; // End cards
+      
+      // Navigation
+      s += "<div class='nav'>";
+      s += "<a href='/status' class='btn'>Status</a>";
+      s += "<a href='/stats' class='btn'>Stats</a>";
+      s += "<a href='/mqttconfig' class='btn btn-primary'>MQTT</a>";
+      s += "<a href='/debug' class='btn'>Debug</a>";
+      s += "<a href='/reset' class='btn btn-danger' onclick='return confirm(\"Reset?\")'>Reset</a>";
+      s += "</div>";
+      s += "</div></body></html>";
+      server.send(200, "text/html", s);
     });
     
     server.on("/status", []() {
@@ -1107,12 +1799,16 @@ void setup() {
       status["wifiConnected"] = WiFi.status() == WL_CONNECTED;
       status["wifiIP"] = WiFi.localIP().toString();
       status["wifiRSSI"] = WiFi.RSSI();
-      status["mqttConnected"] = client.connected();
+      status["mqttConnected"] = getMQTTClient().connected();
       status["mqttServer"] = String(mqtt) + ":" + String(mqttport);
+      status["mqttSSL"] = useMQTTS;
+      status["mqttAuth"] = (strlen(mqttuser) > 0 && strlen(mqttpass) > 0);
       status["espsomfyHost"] = String(espsomfyhost) + ":" + String(espsomfyport);
       status["topicPrefix"] = String(mqtttopic);
       status["lastError"] = lastError;
       status["lastErrorTime"] = lastErrorTime;
+      status["mqttLogging"] = mqttLogging;
+      status["logMessages"] = logMessageCounter;
       
       String statusJson;
       serializeJson(status, statusJson);
@@ -1143,11 +1839,22 @@ void setup() {
       }
     });
     
+    server.on("/mqttconfig", []() {
+      MQTT_Config_Page();
+    });
+    
+    server.on("/mqttupdate", []() {
+      Update_MQTT_Config();
+    });
+    
     server.on("/reset",resetSettings);
   }
 }
 
 void loop() {
+  // Feed watchdog to prevent resets
+  yield();
+  
   if (startServer == 0){ 
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
@@ -1172,17 +1879,26 @@ void loop() {
   // Handle captive portal DNS
   if (captiveNetwork == 1){
     dnsServer.processNextRequest();
+    yield(); // Feed watchdog
   }
   
   // Handle web server requests
   server.handleClient();
+  yield(); // Feed watchdog
+  
+  // Update mDNS if connected to WiFi
+  if (WiFi.status() == WL_CONNECTED && captiveNetwork == 0) {
+    MDNS.update();
+  }
   
   // Handle MQTT if connected
   if(networkConnected == 1){
-    if (!client.connected()) {
+    PubSubClient& mqttClient = getMQTTClient();
+    if (!mqttClient.connected()) {
       reconnect();
     } else {
-      client.loop();
+      mqttClient.loop();
+      yield(); // Feed watchdog
       
       // Publish heartbeat periodically
       unsigned long now = millis();
@@ -1193,13 +1909,7 @@ void loop() {
     }
   }
   
-  // Check for special MQTT commands (like debug toggle)
-  if (networkConnected && client.connected()) {
-    // Handle bridge control commands
-    String debugTopic = String(mqtttopic) + "/bridge/debug/set";
-    // This is handled in the callback function
-  }
-  
-  // Small delay to prevent watchdog issues
-  delay(50);
+  // Small delay to prevent tight loop
+  delay(10);
+  yield(); // Feed watchdog one more time
 }
